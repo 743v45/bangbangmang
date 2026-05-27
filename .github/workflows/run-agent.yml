@@ -141,7 +141,7 @@ jobs:
             create_pr "target-repo" "${{ github.event.inputs.target_repo }}"
           fi
 
-      - name: Update issue status on success
+      - name: Update issue status to PR created
         if: success()
         uses: actions/github-script@v7
         with:
@@ -154,12 +154,12 @@ jobs:
             }).catch(() => {});
             await github.rest.issues.addLabels({
               owner: context.repo.owner, repo: context.repo.repo,
-              issue_number, labels: ['status:done']
+              issue_number, labels: ['status:pr-created']
             });
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number,
-              body: `✅ Agent execution **succeeded** at ${new Date().toISOString()}\n\nA PR has been created. Please review and merge.`
+              body: `🔄 PR created at ${new Date().toISOString()}\n\nPlease review and merge. Issue will be auto-closed on merge.`
             });
 
       - name: Update issue status on failure
