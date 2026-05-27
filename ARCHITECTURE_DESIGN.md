@@ -2,7 +2,7 @@
 
 > 项目代号：`mymy/subtitles`（Project A — 控制中心）
 > 创建日期：2026-05-28
-> 状态：MVP 实施中
+> 状态：MVP 已完成
 
 ---
 
@@ -20,10 +20,13 @@
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| **MVP** | 静态面板管理 Issues + 设定执行时间/项目/提示词 + Actions 用 opencode 执行 | 🔄 进行中 |
-| **V2** | 状态追踪（执行进度、PR 结果） | 待开始 |
-| **V3** | Cloudflare Worker 代理（鉴权、Cron 触发） | 待开始 |
-| **V4** | 多项目完整管理 | 待开始 |
+| **MVP** | 静态面板管理 Issues + 设定执行时间/项目/提示词 + Actions 用 opencode 执行 | ✅ 已完成 |
+| **V2** | Cloudflare Worker Cron 定时触发 | ✅ 已完成 |
+| **V3** | PR 创建 + 自动关闭 Issue | ✅ 已完成 |
+| **V4** | 外部调度器（dry-run 支持） | ✅ 已完成 |
+| **V5** | 状态追踪（执行进度、PR 结果） | 待开始 |
+| **V6** | Cloudflare Worker 代理鉴权 | 待开始 |
+| **V7** | 多项目完整管理 | 待开始 |
 
 ---
 
@@ -91,16 +94,22 @@
 
 ---
 
-## 4. MVP 文件清单
+## 4. 文件清单
 
 ```
 subtitles/
 ├── docs/
-│   └── index.html              # 静态面板 SPA
+│   └── index.html              # 静态面板 SPA（Tailwind CDN + Vanilla JS）
 ├── .github/
 │   └── workflows/
 │       ├── pages.yml           # Pages 部署
-│       └── run-agent.yml       # Agent 执行 workflow
+│       ├── run-agent.yml       # Agent 执行（创建 PR，不直接 push）
+│       ├── scheduler.yml       # 外部调度器（workflow_dispatch + dry-run）
+│       └── pr-merged.yml       # PR 合并后自动关闭 Issue
+├── cloudflare-worker/
+│   ├── src/index.js            # Worker：Cron 触发 scheduler
+│   ├── wrangler.toml           # 每 5 分钟 Cron
+│   └── package.json
 └── ARCHITECTURE_DESIGN.md      # 本文档
 ```
 
@@ -254,11 +263,14 @@ Workflow 内根据 `agent` 参数选择执行脚本：
 
 ---
 
-## 6. 定时执行方案（MVP 用 workflow_dispatch 手动触发）
+## 6. 定时执行方案
 
-MVP 不做 Cron，手动触发验证链路。定时执行留给 V3（Cloudflare Worker Cron）。
+已实现完整链路：
 
-后续定时实现方式：
+1. **手动触发**：面板点击「立即执行」→ workflow_dispatch → run-agent.yml
+2. **定时触发**：Cloudflare Worker Cron（每 5 分钟）→ scheduler.yml → 扫描到期 Issue → 触发 run-agent.yml
+3. **PR 流程**：run-agent.yml 创建分支 + PR → 用户审查合并 → pr-merged.yml 自动关闭 Issue
+4. **Dry-run**：scheduler.yml 支持 `dry_run=true`，仅输出日志不实际执行后续定时实现方式：
 1. 面板设定执行时间 → 写入 Issue Body
 2. Cloudflare Worker Cron 定期扫描到期 Issue
 3. 调 GitHub API `workflow_dispatch` 触发执行
@@ -276,25 +288,38 @@ MVP 不做 Cron，手动触发验证链路。定时执行留给 V3（Cloudflare 
 
 ## 8. 验证步骤
 
-```
-1. Push 代码到 A 仓库
-2. GitHub Pages 自动部署面板
-3. 打开面板，输入 GitHub Token
-4. 创建一个 Issue：填写目标项目、提示词
-5. 点击「立即执行」
-6. 查看 A 仓库 Actions → run-agent workflow 被触发
-7. Agent 在目标项目执行任务
-8. Issue 自动更新状态为 done/failed
+### 面板 E2E 验证（已通过）
+
+1. 本地启动 `python3 -m http.server 8080 --directory docs`
+2. 打开面板 → 无 Token 时自动跳转设置页 ✅
+3. 输入 Token + 仓库地址 → 保存 ✅
+4. 任务列表页 → 状态筛选 + 刷新按钮 ✅
+5. 创建任务页 → 标题/目标项目/执行时间/AI 客户端/提示词 + 双按钮 ✅
+6. 执行记录页 → 展示 workflow runs ✅
+7. 编辑任务页 → 修改/触发/关闭 ✅
+
+### 完整流程验证
+
+1. Push 代码到 A 仓库 → GitHub Pages 自动部署
+2. 打开面板，输入 GitHub Token
+3. 创建 Issue：填写目标项目、执行时间、提示词
+4. 点击「立即执行」→ 触发 run-agent.yml
+5. Agent 创建 PR（不直接 push）
+6. 用户审查 PR → 合并
+7. pr-merged.yml 自动关闭 Issue 并标记 status:done
 ```
 
 ---
 
 ## 9. 待决策事项
 
-| # | 问题 | 当前决定 |
-|---|------|----------|
-| 1 | Token 管理 | 前端 localStorage（MVP），后续 Worker 代理 |
-| 2 | AI 客户端 | 先 opencode，后续可换 |
-| 3 | 定时触发 | MVP 手动，后续 Worker Cron |
-| 4 | 目标项目 | MVP 先操作 A 自己，后续扩展 B/C/D |
-| 5 | 面板框架 | 单文件 HTML + Tailwind CDN |
+| # | 问题 | 当前决定 | 状态 |
+|---|------|----------|------|
+| 1 | Token 管理 | 前端 localStorage | ✅ 已实现，后续 V6 Worker 代理 |
+| 2 | AI 客户端 | opencode，面板支持切换 claude-code | ✅ 已实现 |
+| 3 | 定时触发 | Cloudflare Worker Cron → scheduler.yml | ✅ 已实现 |
+| 4 | 目标项目 | 支持任意 owner/repo | ✅ 已实现 |
+| 5 | 面板框架 | 单文件 HTML + Tailwind CDN | ✅ 已实现 |
+| 6 | PR 流程 | 创建 PR + 合并后自动关闭 Issue | ✅ 已实现 |
+| 7 | Worker 代理鉴权 | 待 V6 | 待开始 |
+| 8 | 多项目管理 | 待 V7 | 待开始 |
