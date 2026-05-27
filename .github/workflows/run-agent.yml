@@ -1,0 +1,164 @@
+name: Run Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number to process'
+        required: true
+      target_repo:
+        description: 'Target repository (owner/repo), empty for self'
+        required: false
+        default: ''
+      agent:
+        description: 'Agent client'
+        required: false
+        default: 'opencode'
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: agent-${{ github.event.inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout target repo
+        if: github.event.inputs.target_repo != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.target_repo }}
+          token: ${{ secrets.PAT_TOKEN }}
+          path: target-repo
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install opencode
+        run: npm install -g opencode-ai
+
+      - name: Read issue and run agent
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          ISSUE_NUMBER="${{ github.event.inputs.issue_number }}"
+          REPO="${{ github.repository }}"
+
+          # Fetch issue body
+          ISSUE_DATA=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json title,body,labels)
+          TITLE=$(echo "$ISS_DATA" | jq -r '.title')
+          BODY=$(echo "$ISSUE_DATA" | jq -r '.body')
+
+          # Extract prompt from issue body (content under "## 提示词")
+          PROMPT=$(echo "$BODY" | sed -n '/^## 提示词/,$ p' | tail -n +2 | sed '/^## /q' | head -n -1)
+
+          # If no explicit prompt section, use the full body
+          if [ -z "$PROMPT" ]; then
+            PROMPT="$BODY"
+          fi
+
+          echo "=== Task: $TITLE ==="
+          echo "=== Prompt ==="
+          echo "$PROMPT"
+
+          # Update issue status to running
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label "status:pending" || true
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label "status:running"
+
+          # Run agent based on type
+          TARGET="${{ github.event.inputs.target_repo }}"
+          if [ -n "$TARGET" ]; then
+            cd target-repo
+          fi
+
+          case "${{ github.event.inputs.agent }}" in
+            opencode)
+              echo "$PROMPT" | opencode --prompt -
+              ;;
+            claude-code)
+              claude "$PROMPT"
+              ;;
+            *)
+              echo "Unknown agent: ${{ github.event.inputs.agent }}"
+              exit 1
+              ;;
+          esac
+
+      - name: Commit and push changes
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || {
+            git commit -m "feat: agent task #${{ github.event.inputs.issue_number }} [skip ci]"
+            git pull --rebase origin HEAD
+            git push
+          }
+          # Also push target repo if exists
+          if [ -d "target-repo" ]; then
+            cd target-repo
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git diff --staged --quiet || {
+              git commit -m "feat: agent task #${{ github.event.inputs.issue_number }} [skip ci]"
+              git pull --rebase origin HEAD
+              git push
+            }
+          fi
+
+      - name: Update issue status on success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const issue_number = ${{ github.event.inputs.issue_number }};
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number, name: 'status:running'
+            }).catch(() => {});
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number, labels: ['status:done']
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number,
+              body: `✅ Agent execution **succeeded** at ${new Date().toISOString()}`
+            });
+
+      - name: Update issue status on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const issue_number = ${{ github.event.inputs.issue_number }};
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number, name: 'status:running'
+            }).catch(() => {});
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number, labels: ['status:failed']
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number,
+              body: `❌ Agent execution **failed** at ${new Date().toISOString()}\n\nCheck [workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) for details.`
+            });
