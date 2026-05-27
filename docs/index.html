@@ -64,10 +64,10 @@
     return api(`/issues/${num}`, { method: 'PATCH', body: JSON.stringify(data) });
   }
 
-  async function triggerWorkflow(issue_number, target_repo, prompt, agent) {
+  async function triggerWorkflow(issue_number, target_repo, agent) {
     return api('/actions/workflows/run-agent.yml/dispatches', {
       method: 'POST',
-      body: JSON.stringify({ ref: 'master', inputs: { issue_number: String(issue_number), target_repo: target_repo || '', agent: agent || 'opencode', prompt: prompt || '' } })
+      body: JSON.stringify({ ref: 'master', inputs: { issue_number: String(issue_number), target_repo: target_repo || '', agent: agent || 'opencode' } })
     });
   }
 
@@ -339,7 +339,7 @@
     try {
       const issue = await getIssue(num);
       const p = parseIssueBody(issue.body);
-      await triggerWorkflow(num, p.targetRepo, p.prompt, p.agent);
+      await triggerWorkflow(num, p.targetRepo, p.agent);
       toast('已触发执行', 'success');
       await loadIssues();
     } catch (e) {
@@ -416,7 +416,7 @@
       const issue = await createIssue(title, body, ['status:pending']);
       toast(`任务 #${issue.number} 已创建`, 'success');
       if (andTrigger) {
-        await triggerWorkflow(issue.number, targetRepo, prompt, agent);
+        await triggerWorkflow(issue.number, targetRepo, agent);
         toast('已触发执行', 'success');
       }
       navigate('issues');
@@ -519,7 +519,7 @@
     try {
       const issue = await getIssue(num);
       const p = parseIssueBody(issue.body);
-      await triggerWorkflow(num, p.targetRepo, p.prompt, p.agent);
+      await triggerWorkflow(num, p.targetRepo, p.agent);
       toast('已触发执行', 'success');
       navigate('issues');
     } catch (e) {

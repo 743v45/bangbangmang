@@ -59,7 +59,7 @@ jobs:
 
           # Fetch issue body
           ISSUE_DATA=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json title,body,labels)
-          TITLE=$(echo "$ISS_DATA" | jq -r '.title')
+          TITLE=$(echo "$ISSUE_DATA" | jq -r '.title')
           BODY=$(echo "$ISSUE_DATA" | jq -r '.body')
 
           # Extract prompt from issue body (content under "## 提示词")
@@ -109,7 +109,7 @@ jobs:
             local repo="$2"
             cd "$dir"
 
-            if git diff --quiet; then
+            if git diff --quiet && git diff --cached --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
               echo "No changes in $repo"
               return
             fi
