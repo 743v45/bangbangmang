@@ -1,9 +1,13 @@
 name: Scheduler
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
+  # 不使用 GitHub schedule，由外部定时器触发（Cloudflare Worker Cron / cron-job.org 等）
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'If true, only log what would be triggered'
+        required: false
+        default: 'false'
 
 permissions:
   issues: write
@@ -18,8 +22,9 @@ jobs:
           github-token: ${{ secrets.PAT_TOKEN }}
           script: |
             const now = new Date();
+            const dryRun = '${{ github.event.inputs.dry_run }}' === 'true';
+            const triggered = [];
 
-            // Find all issues with status:pending label
             const issues = await github.paginate(github.rest.issues.listForRepo, {
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -29,38 +34,38 @@ jobs:
             });
 
             for (const issue of issues) {
-              // Extract execution time from body
               const body = issue.body || '';
               const timeMatch = body.match(/\*\*执行时间\*\*:\s*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})/);
 
               if (!timeMatch) {
-                console.log(`Issue #${issue.number}: no execution time found, skipping`);
+                console.log(`Issue #${issue.number}: no execution time, skipping`);
                 continue;
               }
 
               const scheduledTime = new Date(timeMatch[1]);
               if (isNaN(scheduledTime.getTime())) {
-                console.log(`Issue #${issue.number}: invalid time format, skipping`);
+                console.log(`Issue #${issue.number}: invalid time, skipping`);
                 continue;
               }
 
-              // Check if it's time
               if (now < scheduledTime) {
-                console.log(`Issue #${issue.number}: scheduled at ${scheduledTime.toISOString()}, not yet (now: ${now.toISOString()})`);
+                console.log(`Issue #${issue.number}: not yet (${scheduledTime.toISOString()})`);
                 continue;
               }
 
-              // Extract target repo
               const repoMatch = body.match(/\*\*目标项目\*\*:\s*(\S+)/);
               const targetRepo = repoMatch ? repoMatch[1] : '';
-
-              // Extract agent type
               const agentMatch = body.match(/\*\*AI 客户端\*\*:\s*(\S+)/);
               const agent = agentMatch ? agentMatch[1] : 'opencode';
 
-              console.log(`Issue #${issue.number}: triggering! target=${targetRepo || 'self'}, agent=${agent}`);
+              console.log(`Issue #${issue.number}: due! target=${targetRepo || 'self'}, agent=${agent}`);
 
-              // Trigger run-agent workflow
+              if (dryRun) {
+                console.log('Dry run, skipping dispatch');
+                triggered.push({ issue: issue.number, target: targetRepo, agent });
+                continue;
+              }
+
               await github.rest.actions.createWorkflowDispatch({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -72,4 +77,9 @@ jobs:
                   agent: agent
                 }
               });
+
+              triggered.push({ issue: issue.number, target: targetRepo, agent });
             }
+
+            console.log(`Result: ${triggered.length} tasks triggered`);
+            console.log(JSON.stringify(triggered, null, 2));
