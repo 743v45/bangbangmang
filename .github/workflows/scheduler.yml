@@ -1,0 +1,75 @@
+name: Scheduler
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  actions: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const now = new Date();
+
+            // Find all issues with status:pending label
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'status:pending',
+              state: 'open',
+              per_page: 100
+            });
+
+            for (const issue of issues) {
+              // Extract execution time from body
+              const body = issue.body || '';
+              const timeMatch = body.match(/\*\*执行时间\*\*:\s*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})/);
+
+              if (!timeMatch) {
+                console.log(`Issue #${issue.number}: no execution time found, skipping`);
+                continue;
+              }
+
+              const scheduledTime = new Date(timeMatch[1]);
+              if (isNaN(scheduledTime.getTime())) {
+                console.log(`Issue #${issue.number}: invalid time format, skipping`);
+                continue;
+              }
+
+              // Check if it's time
+              if (now < scheduledTime) {
+                console.log(`Issue #${issue.number}: scheduled at ${scheduledTime.toISOString()}, not yet (now: ${now.toISOString()})`);
+                continue;
+              }
+
+              // Extract target repo
+              const repoMatch = body.match(/\*\*目标项目\*\*:\s*(\S+)/);
+              const targetRepo = repoMatch ? repoMatch[1] : '';
+
+              // Extract agent type
+              const agentMatch = body.match(/\*\*AI 客户端\*\*:\s*(\S+)/);
+              const agent = agentMatch ? agentMatch[1] : 'opencode';
+
+              console.log(`Issue #${issue.number}: triggering! target=${targetRepo || 'self'}, agent=${agent}`);
+
+              // Trigger run-agent workflow
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'run-agent.yml',
+                ref: 'master',
+                inputs: {
+                  issue_number: String(issue.number),
+                  target_repo: targetRepo,
+                  agent: agent
+                }
+              });
+            }
