@@ -278,7 +278,7 @@
 
   async function loadIssues() {
     try {
-      const data = await listIssues('open', issuesFilter);
+      const data = await listIssues('all', issuesFilter);
       issuesCache = data.filter(i => !i.pull_request);
       renderIssuesList();
     } catch (e) {
