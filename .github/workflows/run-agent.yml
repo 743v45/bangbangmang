@@ -249,19 +249,31 @@ jobs:
             # Read template
             PROMPT=$(cat /tmp/prompt_template.txt)
 
-            # Replace template variables (use awk for multiline-safe replacement)
-            PROMPT=$(awk -v num="$ISSUE_NUMBER" -v title="$TITLE" -v desc="$RAW_PROMPT" -v prompt="$RAW_PROMPT" -v attempt="$ATTEMPT" -v max="$MAX_ATTEMPTS" -v err="$PREVIOUS_ERROR" '
-              {
-                gsub(/{{issue.number}}/, num)
-                gsub(/{{issue.title}}/, title)
-                gsub(/{{issue.description}}/, desc)
-                gsub(/{{prompt}}/, prompt)
-                gsub(/{{attempt}}/, attempt)
-                gsub(/{{max_attempts}}/, max)
-                gsub(/{{previous_error}}/, err)
-                print
-              }
-            ' <<< "$PROMPT")
+            # Replace template variables (write to file for multiline-safe processing)
+            echo "$PROMPT" > /tmp/prompt_intermediate.txt
+
+            # Use awk for replacements - variables may contain newlines
+            awk -v num="$ISSUE_NUMBER" -v title="$TITLE" \
+              'gsub(/{{issue.number}}/, num); gsub(/{{issue.title}}/, title)' /tmp/prompt_intermediate.txt > /tmp/prompt_step1.txt
+
+            # For multiline variables, use perl
+            perl -e '
+              open(my $fh, "<", "/tmp/prompt_step1.txt");
+              my $content = do { local $/; <$fh> };
+              close($fh);
+              my $desc = $ENV{"RAW_PROMPT"};
+              my $err = $ENV{"PREVIOUS_ERROR"};
+              my $attempt = $ENV{"ATTEMPT"};
+              my $max = $ENV{"MAX_ATTEMPTS"};
+              $content =~ s/{{issue\.description}}/$desc/g;
+              $content =~ s/{{prompt}}/$desc/g;
+              $content =~ s/{{previous_error}}/$err/g;
+              $content =~ s/{{attempt}}/$attempt/g;
+              $content =~ s/{{max_attempts}}/$max/g;
+              print $content;
+            ' > /tmp/prompt_final.txt
+
+            PROMPT=$(cat /tmp/prompt_final.txt)
 
             # Handle conditional blocks: {{#if previous_error}}...{{/if}}
             if [ -z "$PREVIOUS_ERROR" ]; then
