@@ -121,7 +121,7 @@ jobs:
             [ -z "$AGENT_MODELS_JSON" ] || [ "$AGENT_MODELS_JSON" = "{}" ] && AGENT_MODELS_JSON='{}'
 
             # Parse agent.timeout_minutes
-            TIMEOUT_MINUTES=$(echo "$FRONT_MATTER" | grep -oP '(?<=timeout_minutes:\s)\d+' | head -1)
+            TIMEOUT_MINUTES=$(echo "$FRONT_MATTER" | grep -oP '(?<=timeout_minutes:\s)\d+' | head -1 | tr -d ' ')
             [ -z "$TIMEOUT_MINUTES" ] && TIMEOUT_MINUTES=25
 
             # Parse hooks.before_run into JSON array
@@ -190,7 +190,7 @@ jobs:
 
       - name: Build prompt and run agent
         id: run_agent
-        timeout-minutes: ${{ steps.workflow_config.outputs.timeout_minutes }}
+        timeout-minutes: 25
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
           OPENCODE_NO_AUTO_EXECUTE: '1'
