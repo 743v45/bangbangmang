@@ -1,0 +1,11 @@
+# Cloudflare Worker cache
+cloudflare-worker/.wrangler/
+
+# Agent workspace checkout
+target-repo/
+
+# Screenshots
+*.png
+*.jpg
+*.jpeg
+*.gif
