@@ -310,26 +310,27 @@ jobs:
           if [ -n "$HOOKS_BEFORE" ] && [ "$HOOKS_BEFORE" != '[]' ] && [ "$HOOKS_BEFORE" != 'null' ]; then
             HOOK_COUNT=$(echo "$HOOKS_BEFORE" | jq 'length' 2>/dev/null || echo "0")
             if [ "$HOOK_COUNT" -gt 0 ]; then
-            echo "=== Running before_run hooks ($HOOK_COUNT) ==="
-            WORK_DIR="${{ github.workspace }}"
-            if [ -n "${{ github.event.inputs.target_repo }}" ] && [ -d "target-repo" ]; then
-              WORK_DIR="${{ github.workspace }}/target-repo"
-            fi
-
-            for i in $(seq 0 $((HOOK_COUNT - 1))); do
-              HOOK_CMD=$(echo "$HOOKS_BEFORE" | jq -r ".[$i]")
-              # Replace template variables in hook command
-              HOOK_CMD=$(echo "$HOOK_CMD" | sed "s|{{issue.number}}|$ISSUE_NUMBER|g")
-              HOOK_CMD=$(echo "$HOOK_CMD" | sed "s|{{issue.title}}|$TITLE|g")
-              HOOK_CMD=$(echo "$HOOK_CMD" | sed "s|{{attempt}}|$ATTEMPT|g")
-              echo "Running before_run hook [$i]: $HOOK_CMD"
-              cd "$WORK_DIR"
-              eval "$HOOK_CMD"
-              if [ $? -ne 0 ]; then
-                echo "::error::before_run hook [$i] failed, aborting run"
-                exit 1
+              echo "=== Running before_run hooks ($HOOK_COUNT) ==="
+              WORK_DIR="${{ github.workspace }}"
+              if [ -n "${{ github.event.inputs.target_repo }}" ] && [ -d "target-repo" ]; then
+                WORK_DIR="${{ github.workspace }}/target-repo"
               fi
-            done
+
+              for i in $(seq 0 $((HOOK_COUNT - 1))); do
+                HOOK_CMD=$(echo "$HOOKS_BEFORE" | jq -r ".[$i]")
+                # Replace template variables in hook command
+                HOOK_CMD=$(echo "$HOOK_CMD" | sed "s|{{issue.number}}|$ISSUE_NUMBER|g")
+                HOOK_CMD=$(echo "$HOOK_CMD" | sed "s|{{issue.title}}|$TITLE|g")
+                HOOK_CMD=$(echo "$HOOK_CMD" | sed "s|{{attempt}}|$ATTEMPT|g")
+                echo "Running before_run hook [$i]: $HOOK_CMD"
+                cd "$WORK_DIR"
+                eval "$HOOK_CMD"
+                if [ $? -ne 0 ]; then
+                  echo "::error::before_run hook [$i] failed, aborting run"
+                  exit 1
+                fi
+              done
+            fi
           fi
 
           # --- Run agent ---
