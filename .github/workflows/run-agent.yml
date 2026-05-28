@@ -56,6 +56,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
           OPENCODE_NO_AUTO_EXECUTE: '1'
+          OPENCODE_CONFIG_CONTENT: '{"model":"deepseek/deepseek-v4-flash-free"}'
         run: |
           ISSUE_NUMBER="${{ github.event.inputs.issue_number }}"
           REPO="${{ github.repository }}"
@@ -101,11 +102,13 @@ jobs:
           esac
 
       - name: Create PR with changes
+        id: create_pr
         if: success()
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           BRANCH="agent/task-${{ github.event.inputs.issue_number }}-$(date +%Y%m%d-%H%M%S)"
+          CHANGES_MADE=false
 
           create_pr() {
             local dir="$1"
@@ -114,7 +117,7 @@ jobs:
 
             if git diff --quiet && git diff --cached --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
               echo "No changes in $repo"
-              return
+              return 1
             fi
 
             git config user.name "github-actions[bot]"
@@ -137,15 +140,21 @@ jobs:
           }
 
           # Self repo
-          create_pr "${{ github.workspace }}" "${{ github.repository }}"
+          if create_pr "${{ github.workspace }}" "${{ github.repository }}"; then
+            CHANGES_MADE=true
+          fi
 
           # Target repo if exists
           if [ -d "target-repo" ]; then
-            create_pr "target-repo" "${{ github.event.inputs.target_repo }}"
+            if create_pr "target-repo" "${{ github.event.inputs.target_repo }}"; then
+              CHANGES_MADE=true
+            fi
           fi
 
+          echo "changes_made=$CHANGES_MADE" >> $GITHUB_OUTPUT
+
       - name: Update issue status to PR created
-        if: success()
+        if: success() && steps.create_pr.outputs.changes_made == 'true'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
@@ -163,6 +172,27 @@ jobs:
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number,
               body: `🔄 PR created at ${new Date().toISOString()}\n\nPlease review and merge. Issue will be auto-closed on merge.`
+            });
+
+      - name: Update issue status - no changes
+        if: success() && steps.create_pr.outputs.changes_made != 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const issue_number = ${{ github.event.inputs.issue_number }};
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number, name: 'status:running'
+            }).catch(() => {});
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number, labels: ['status:failed']
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number,
+              body: `⚠️ Agent completed but made no changes at ${new Date().toISOString()}`
             });
 
       - name: Update issue status on failure
