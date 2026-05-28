@@ -257,7 +257,7 @@ jobs:
             # Handle conditional blocks: {{#if previous_error}}...{{/if}}
             if [ -z "$PREVIOUS_ERROR" ]; then
               # Remove entire conditional blocks when previous_error is empty
-              PROMPT=$(echo "$PROMPT" | perl -0777 -pe 's/\{\{#if previous_error\}\}.*?\{\{\/if\}\}//gs')
+              PROMPT=$(echo "$PROMPT" | sed '/{{#if previous_error}}/,/{{\/if}}/d')
             else
               # Keep block content but strip if/endif markers
               PROMPT=$(echo "$PROMPT" | sed 's/{{#if previous_error}}//g')
