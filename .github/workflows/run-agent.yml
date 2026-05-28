@@ -110,20 +110,8 @@ jobs:
             AGENT_DEFAULT=$(echo "$FRONT_MATTER" | grep -oP '(?<=default:\s).+' | head -1)
             [ -z "$AGENT_DEFAULT" ] && AGENT_DEFAULT="opencode"
 
-            # Parse agent.models into JSON (simplified approach)
-            AGENT_MODELS_JSON=$(echo "$FRONT_MATTER" | awk '
-              BEGIN { found=0; print "{" }
-              /models:/ { found=1; next }
-              found && /^[a-z]/ { exit }
-              found && /^\s+[a-z]+:/ {
-                gsub(/^[[:space:]]+/, ""); gsub(/:[[:space:]]*/, ":");
-                gsub(/"/, "\\\"");
-                if (NR > 1) printf ","
-                printf "\"%s\"", $0
-              }
-              END { print "}" }
-            ')
-            [ -z "$AGENT_MODELS_JSON" ] || [ "$AGENT_MODELS_JSON" = "{}" ] && AGENT_MODELS_JSON='{}'
+            # Parse agent.models - extract model for specific agent
+            # We'll parse this at runtime in the agent step instead
 
             # Parse agent.timeout_minutes
             TIMEOUT_MINUTES=$(echo "$FRONT_MATTER" | grep -oP '(?<=timeout_minutes:\s)\d+' | head -1 | tr -d ' ')
@@ -174,7 +162,6 @@ jobs:
           # Export as step outputs
           echo "has_workflow_md=$HAS_WORKFLOW_MD" >> $GITHUB_OUTPUT
           echo "agent_default=$AGENT_DEFAULT" >> $GITHUB_OUTPUT
-          echo "agent_models_json=$AGENT_MODELS_JSON" >> $GITHUB_OUTPUT
           echo "timeout_minutes=$TIMEOUT_MINUTES" >> $GITHUB_OUTPUT
           echo "hooks_before_json=$HOOKS_BEFORE_JSON" >> $GITHUB_OUTPUT
           echo "hooks_after_json=$HOOKS_AFTER_JSON" >> $GITHUB_OUTPUT
@@ -216,11 +203,23 @@ jobs:
           fi
 
           # --- Resolve model from config ---
-          AGENT_MODELS_JSON='${{ steps.workflow_config.outputs.agent_models_json }}'
           DEFAULT_MODEL="opencode/deepseek-v4-flash-free"
           MODEL="$DEFAULT_MODEL"
-          if [ "$AGENT_MODELS_JSON" != '{}' ]; then
-            CONFIGURED_MODEL=$(echo "$AGENT_MODELS_JSON" | jq -r --arg agent "$AGENT" '.[$agent] // empty')
+
+          # Try to read model from WORKFLOW.md if it exists
+          if [ -f "WORKFLOW.md" ]; then
+            # Extract the model line for this agent from models section
+            CONFIGURED_MODEL=$(awk -v agent="$AGENT" '
+              BEGIN { in_models=0 }
+              /models:/ { in_models=1; next }
+              in_models && /^[a-z]/ && !/^models/ { exit }
+              in_models && $1 == agent":" {
+                gsub(/^[[:space:]]*[^[:space:]]+:[[:space:]]*/, "")
+                gsub(/"/, "")
+                print
+                exit
+              }
+            ' WORKFLOW.md)
             if [ -n "$CONFIGURED_MODEL" ]; then
               MODEL="$CONFIGURED_MODEL"
             fi
