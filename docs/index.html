@@ -531,7 +531,13 @@
   window.closeIssue = async function(num) {
     if (!confirm('确定关闭此任务？')) return;
     try {
-      await updateIssue(num, { state: 'closed' });
+      const issue = await getIssue(num);
+      const statusLabels = issue.labels.filter(l => l.name.startsWith('status:')).map(l => l.name);
+      // Remove existing status labels, add status:failed
+      for (const label of statusLabels) {
+        await api(`/issues/${num}/labels/${label}`, { method: 'DELETE' }).catch(() => {});
+      }
+      await updateIssue(num, { state: 'closed', labels: ['status:failed'] });
       toast('已关闭', 'success');
       navigate('issues');
     } catch (e) {
