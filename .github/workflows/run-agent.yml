@@ -1,5 +1,7 @@
 name: Run Agent
 
+run-name: "Issue #${{ inputs.issue_number }} via ${{ inputs.agent }}"
+
 on:
   workflow_dispatch:
     inputs:
