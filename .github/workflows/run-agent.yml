@@ -55,6 +55,7 @@ jobs:
         timeout-minutes: 25
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          OPENCODE_NO_AUTO_EXECUTE: '1'
         run: |
           ISSUE_NUMBER="${{ github.event.inputs.issue_number }}"
           REPO="${{ github.repository }}"
@@ -88,7 +89,7 @@ jobs:
 
           case "${{ github.event.inputs.agent }}" in
             opencode)
-              echo "$PROMPT" | opencode --prompt -
+              opencode run "$PROMPT"
               ;;
             claude-code)
               claude "$PROMPT"
