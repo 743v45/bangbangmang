@@ -249,14 +249,19 @@ jobs:
             # Read template
             PROMPT=$(cat /tmp/prompt_template.txt)
 
-            # Replace template variables
-            PROMPT=$(echo "$PROMPT" | sed "s|{{issue.number}}|$ISSUE_NUMBER|g")
-            PROMPT=$(echo "$PROMPT" | sed "s|{{issue.title}}|$TITLE|g")
-            PROMPT=$(echo "$PROMPT" | sed "s|{{issue.description}}|$RAW_PROMPT|g")
-            PROMPT=$(echo "$PROMPT" | sed "s|{{prompt}}|$RAW_PROMPT|g")
-            PROMPT=$(echo "$PROMPT" | sed "s|{{attempt}}|$ATTEMPT|g")
-            PROMPT=$(echo "$PROMPT" | sed "s|{{max_attempts}}|$MAX_ATTEMPTS|g")
-            PROMPT=$(echo "$PROMPT" | sed "s|{{previous_error}}|$PREVIOUS_ERROR|g")
+            # Replace template variables (use awk for multiline-safe replacement)
+            PROMPT=$(awk -v num="$ISSUE_NUMBER" -v title="$TITLE" -v desc="$RAW_PROMPT" -v prompt="$RAW_PROMPT" -v attempt="$ATTEMPT" -v max="$MAX_ATTEMPTS" -v err="$PREVIOUS_ERROR" '
+              {
+                gsub(/{{issue.number}}/, num)
+                gsub(/{{issue.title}}/, title)
+                gsub(/{{issue.description}}/, desc)
+                gsub(/{{prompt}}/, prompt)
+                gsub(/{{attempt}}/, attempt)
+                gsub(/{{max_attempts}}/, max)
+                gsub(/{{previous_error}}/, err)
+                print
+              }
+            ' <<< "$PROMPT")
 
             # Handle conditional blocks: {{#if previous_error}}...{{/if}}
             if [ -z "$PREVIOUS_ERROR" ]; then
