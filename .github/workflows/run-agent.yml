@@ -279,9 +279,10 @@ jobs:
 
           # --- Execute before_run hooks ---
           HOOKS_BEFORE='${{ steps.workflow_config.outputs.hooks_before_json }}'
-          HOOK_COUNT=$(echo "$HOOKS_BEFORE" | jq 'length')
-
-          if [ "$HOOK_COUNT" -gt 0 ] && [ "$HOOKS_BEFORE" != '[]' ]; then
+          # Only run hooks if we have a non-empty JSON array
+          if [ -n "$HOOKS_BEFORE" ] && [ "$HOOKS_BEFORE" != '[]' ] && [ "$HOOKS_BEFORE" != 'null' ]; then
+            HOOK_COUNT=$(echo "$HOOKS_BEFORE" | jq 'length' 2>/dev/null || echo "0")
+            if [ "$HOOK_COUNT" -gt 0 ]; then
             echo "=== Running before_run hooks ($HOOK_COUNT) ==="
             WORK_DIR="${{ github.workspace }}"
             if [ -n "${{ github.event.inputs.target_repo }}" ] && [ -d "target-repo" ]; then
