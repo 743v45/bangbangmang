@@ -1,7 +1,6 @@
 name: Scheduler
 
 on:
-  # 不使用 GitHub schedule，由外部定时器触发（Cloudflare Worker Cron / cron-job.org 等）
   workflow_dispatch:
     inputs:
       dry_run:
@@ -12,74 +11,287 @@ on:
 permissions:
   issues: write
   actions: write
+  contents: read
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
           script: |
             const now = new Date();
             const dryRun = '${{ github.event.inputs.dry_run }}' === 'true';
-            const triggered = [];
 
-            const issues = await github.paginate(github.rest.issues.listForRepo, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              labels: 'status:pending',
-              state: 'open',
-              per_page: 100
+            // ── Read WORKFLOW.md config ──────────────────────────────────
+            const fs = require('fs');
+            const path = require('path');
+            const configDefaults = {
+              max_parallel: 3,
+              max_attempts: 3,
+              backoff_base: 300,
+              backoff_multiplier: 2,
+              stuck_timeout: 1800
+            };
+            let config = { ...configDefaults };
+
+            const wfPath = path.join(process.env.GITHUB_WORKSPACE, 'WORKFLOW.md');
+            if (fs.existsSync(wfPath)) {
+              const wfContent = fs.readFileSync(wfPath, 'utf8');
+              const yamlMatch = wfContent.match(/^---\n([\s\S]*?)\n---/);
+              if (yamlMatch) {
+                const yaml = yamlMatch[1];
+                const readVal = (key) => {
+                  const m = yaml.match(new RegExp(`${key.replace('.', '\\.')}:\\s*(\\d+)`));
+                  return m ? parseInt(m[1], 10) : undefined;
+                };
+                const parallel = readVal('concurrency.max_parallel');
+                const attempts = readVal('retry.max_attempts');
+                const base = readVal('retry.backoff_base');
+                const multiplier = readVal('retry.backoff_multiplier');
+                const timeout = readVal('reconcile.stuck_timeout');
+                if (parallel !== undefined) config.max_parallel = parallel;
+                if (attempts !== undefined) config.max_attempts = attempts;
+                if (base !== undefined) config.backoff_base = base;
+                if (multiplier !== undefined) config.backoff_multiplier = multiplier;
+                if (timeout !== undefined) config.stuck_timeout = timeout;
+              }
+              console.log(`Config loaded: ${JSON.stringify(config)}`);
+            } else {
+              console.log(`WORKFLOW.md not found, using defaults: ${JSON.stringify(config)}`);
+            }
+
+            // ── Helpers ──────────────────────────────────────────────────
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            function parseBody(body) {
+              const b = body || '';
+              const timeMatch = b.match(/\*\*执行时间\*\*:\s*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})/);
+              const repoMatch = b.match(/\*\*目标项目\*\*:\s*(\S+)/);
+              const agentMatch = b.match(/\*\*AI 客户端\*\*:\s*(\S+)/);
+              const retryMatch = b.match(/\*\*重试次数\*\*:\s*(\d+)/);
+              const nextRetryMatch = b.match(/\*\*下次重试\*\*:\s*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?)/);
+              const lastActivityMatch = b.match(/\*\*最后活动\*\*:\s*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?)/);
+              return {
+                executionTime: timeMatch ? new Date(timeMatch[1]) : null,
+                targetRepo: repoMatch ? repoMatch[1] : '',
+                agent: agentMatch ? agentMatch[1] : 'opencode',
+                retryCount: retryMatch ? parseInt(retryMatch[1], 10) : 0,
+                nextRetryTime: nextRetryMatch ? new Date(nextRetryMatch[1]) : null,
+                lastActivity: lastActivityMatch ? new Date(lastActivityMatch[1]) : null
+              };
+            }
+
+            function updateBodyField(body, field, value) {
+              const regex = new RegExp(`(\\*\\*${field}\\*\\*:\\s*)\\S+`);
+              if (regex.test(body)) {
+                return body.replace(regex, `$1${value}`);
+              }
+              return body + `\n**${field}**: ${value}`;
+            }
+
+            // ── Step 1: Reconcile stuck running issues ───────────────────
+            console.log('=== Step 1: Reconcile stuck running issues ===');
+            const runningIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, labels: 'status:running', state: 'open', per_page: 100
+            });
+            console.log(`Found ${runningIssues.length} running issues`);
+
+            let reconciled = 0;
+            for (const issue of runningIssues) {
+              const timeline = await github.paginate(github.rest.issues.listEventsForTimeline, {
+                owner, repo, issue_number: issue.number, per_page: 100
+              });
+
+              // Find the last labeled event where label is status:running
+              let lastLabeledDate = null;
+              for (let i = timeline.length - 1; i >= 0; i--) {
+                const evt = timeline[i];
+                if (evt.event === 'labeled' && evt.label && evt.label.name === 'status:running') {
+                  lastLabeledDate = new Date(evt.created_at);
+                  break;
+                }
+              }
+
+              if (!lastLabeledDate) {
+                console.log(`Issue #${issue.number}: no status:running label event found, skipping`);
+                continue;
+              }
+
+              const elapsed = (now - lastLabeledDate) / 1000;
+              console.log(`Issue #${issue.number}: elapsed ${Math.round(elapsed)}s since status:running (timeout: ${config.stuck_timeout}s)`);
+
+              if (elapsed > config.stuck_timeout) {
+                console.log(`Issue #${issue.number}: STUCK detected!`);
+                if (dryRun) {
+                  console.log('Dry run, skipping reconciliation');
+                  continue;
+                }
+
+                // Remove status:running, add status:pending
+                await github.rest.issues.removeLabel({ owner, repo, issue_number: issue.number, name: 'status:running' });
+                await github.rest.issues.addLabels({ owner, repo, issue_number: issue.number, labels: ['status:pending'] });
+
+                // Update body: increment retry count, update last activity
+                let body = issue.body || '';
+                const parsed = parseBody(body);
+                const newRetryCount = parsed.retryCount + 1;
+
+                if (newRetryCount >= config.max_attempts) {
+                  // Max retries reached - mark as failed
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: issue.number, name: 'status:pending' });
+                  await github.rest.issues.addLabels({ owner, repo, issue_number: issue.number, labels: ['status:failed'] });
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: issue.number,
+                    body: `**Stuck detected** (elapsed ${Math.round(elapsed / 60)} min, timeout ${Math.round(config.stuck_timeout / 60)} min)\nMax retry attempts (${config.max_attempts}) reached. Marked as failed.`
+                  });
+                  console.log(`Issue #${issue.number}: max retries (${config.max_attempts}) reached, marked as failed`);
+                  continue;
+                }
+
+                body = updateBodyField(body, '重试次数', newRetryCount);
+                body = updateBodyField(body, '最后活动', now.toISOString().replace('T', ' ').slice(0, 16));
+
+                await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
+
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number,
+                  body: `**Stuck detected** (elapsed ${Math.round(elapsed / 60)} min, timeout ${Math.round(config.stuck_timeout / 60)} min)\nReconciled back to status:pending. Retry ${newRetryCount}/${config.max_attempts}.`
+                });
+
+                reconciled++;
+                console.log(`Issue #${issue.number}: reconciled (retry ${newRetryCount}/${config.max_attempts})`);
+              }
+            }
+            console.log(`Reconciled ${reconciled} stuck issues`);
+
+            // ── Step 2: Concurrency check ────────────────────────────────
+            console.log('=== Step 2: Concurrency check ===');
+            const currentRunning = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, labels: 'status:running', state: 'open', per_page: 100
+            });
+            const runningCount = currentRunning.length;
+            const availableSlots = Math.max(0, config.max_parallel - runningCount);
+            console.log(`Running: ${runningCount}, Max parallel: ${config.max_parallel}, Available slots: ${availableSlots}`);
+
+            if (availableSlots === 0) {
+              console.log('No available slots, skipping dispatch');
+              console.log(`Result: 0 tasks dispatched (concurrency full)`);
+              return;
+            }
+
+            // ── Step 3: Dispatch pending/retrying issues ─────────────────
+            console.log('=== Step 3: Dispatch pending/retrying issues ===');
+            const [pendingIssues, retryingIssues] = await Promise.all([
+              github.paginate(github.rest.issues.listForRepo, {
+                owner, repo, labels: 'status:pending', state: 'open', per_page: 100
+              }),
+              github.paginate(github.rest.issues.listForRepo, {
+                owner, repo, labels: 'status:retrying', state: 'open', per_page: 100
+              })
+            ]);
+
+            console.log(`Found ${pendingIssues.length} pending, ${retryingIssues.length} retrying issues`);
+
+            // Build dispatchable list
+            const dispatchable = [];
+
+            for (const issue of [...pendingIssues, ...retryingIssues]) {
+              const parsed = parseBody(issue.body);
+              const isRetrying = issue.labels.some(l => l.name === 'status:retrying');
+
+              // Check timing
+              let isDue = false;
+              if (isRetrying) {
+                if (!parsed.nextRetryTime) {
+                  console.log(`Issue #${issue.number}: retrying but no next_retry_time, treating as due`);
+                  isDue = true;
+                } else if (now >= parsed.nextRetryTime) {
+                  isDue = true;
+                } else {
+                  console.log(`Issue #${issue.number}: retry not yet due (${parsed.nextRetryTime.toISOString()})`);
+                }
+              } else {
+                // status:pending
+                if (!parsed.executionTime) {
+                  // No execution time means immediate
+                  isDue = true;
+                } else if (now >= parsed.executionTime) {
+                  isDue = true;
+                } else {
+                  console.log(`Issue #${issue.number}: not yet due (${parsed.executionTime.toISOString()})`);
+                }
+              }
+
+              if (!isDue) continue;
+
+              // Validate execution time parse
+              if (parsed.executionTime && isNaN(parsed.executionTime.getTime())) {
+                console.log(`Issue #${issue.number}: invalid execution time, skipping`);
+                continue;
+              }
+
+              dispatchable.push({
+                number: issue.number,
+                executionTime: parsed.executionTime,
+                retryCount: parsed.retryCount,
+                targetRepo: parsed.targetRepo,
+                agent: parsed.agent,
+                currentLabel: isRetrying ? 'status:retrying' : 'status:pending'
+              });
+            }
+
+            // Sort: execution time earliest first, then retry count ascending
+            dispatchable.sort((a, b) => {
+              // Issues without execution time (immediate) sort first
+              const aTime = a.executionTime ? a.executionTime.getTime() : 0;
+              const bTime = b.executionTime ? b.executionTime.getTime() : 0;
+              if (aTime !== bTime) return aTime - bTime;
+              return a.retryCount - b.retryCount;
             });
 
-            for (const issue of issues) {
-              const body = issue.body || '';
-              const timeMatch = body.match(/\*\*执行时间\*\*:\s*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})/);
+            console.log(`${dispatchable.length} issues ready for dispatch (sorted by time, then retry count)`);
 
-              if (!timeMatch) {
-                console.log(`Issue #${issue.number}: no execution time, skipping`);
-                continue;
-              }
+            const toDispatch = dispatchable.slice(0, availableSlots);
+            const dispatched = [];
 
-              const scheduledTime = new Date(timeMatch[1]);
-              if (isNaN(scheduledTime.getTime())) {
-                console.log(`Issue #${issue.number}: invalid time, skipping`);
-                continue;
-              }
-
-              if (now < scheduledTime) {
-                console.log(`Issue #${issue.number}: not yet (${scheduledTime.toISOString()})`);
-                continue;
-              }
-
-              const repoMatch = body.match(/\*\*目标项目\*\*:\s*(\S+)/);
-              const targetRepo = repoMatch ? repoMatch[1] : '';
-              const agentMatch = body.match(/\*\*AI 客户端\*\*:\s*(\S+)/);
-              const agent = agentMatch ? agentMatch[1] : 'opencode';
-
-              console.log(`Issue #${issue.number}: due! target=${targetRepo || 'self'}, agent=${agent}`);
+            for (const item of toDispatch) {
+              console.log(`Issue #${item.number}: dispatching (target=${item.targetRepo || 'self'}, agent=${item.agent}, retries=${item.retryCount})`);
 
               if (dryRun) {
                 console.log('Dry run, skipping dispatch');
-                triggered.push({ issue: issue.number, target: targetRepo, agent });
+                dispatched.push({ issue: item.number, target: item.targetRepo, agent: item.agent, dry_run: true });
                 continue;
               }
 
+              // Swap label: remove current status, add status:running
+              await github.rest.issues.removeLabel({ owner, repo, issue_number: item.number, name: item.currentLabel });
+              await github.rest.issues.addLabels({ owner, repo, issue_number: item.number, labels: ['status:running'] });
+
+              // Update body last_activity
+              const { data: currentIssue } = await github.rest.issues.get({ owner, repo, issue_number: item.number });
+              let body = currentIssue.body || '';
+              body = updateBodyField(body, '最后活动', now.toISOString().replace('T', ' ').slice(0, 16));
+              await github.rest.issues.update({ owner, repo, issue_number: item.number, body });
+
+              // Trigger run-agent.yml
               await github.rest.actions.createWorkflowDispatch({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner, repo,
                 workflow_id: 'run-agent.yml',
                 ref: 'master',
                 inputs: {
-                  issue_number: String(issue.number),
-                  target_repo: targetRepo,
-                  agent: agent
+                  issue_number: String(item.number),
+                  target_repo: item.targetRepo,
+                  agent: item.agent
                 }
               });
 
-              triggered.push({ issue: issue.number, target: targetRepo, agent });
+              dispatched.push({ issue: item.number, target: item.targetRepo, agent: item.agent });
             }
 
-            console.log(`Result: ${triggered.length} tasks triggered`);
-            console.log(JSON.stringify(triggered, null, 2));
+            console.log(`Result: ${dispatched.length} tasks dispatched (${reconciled} reconciled, ${runningCount} were running)`);
+            console.log(JSON.stringify(dispatched, null, 2));

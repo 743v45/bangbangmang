@@ -27,9 +27,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  run:
+  check-concurrency:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    outputs:
+      allowed: ${{ steps.check.outputs.allowed }}
+    steps:
+      - name: Check running issue count
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          # Default max_parallel to 3 if not configurable
+          MAX_PARALLEL=3
+
+          # Count issues with status:running label
+          RUNNING=$(gh issue list --repo "$REPO" --label "status:running" --state open --json number -q '. | length')
+
+          echo "Running issues: $RUNNING, Max parallel: $MAX_PARALLEL"
+
+          if [ "$RUNNING" -lt "$MAX_PARALLEL" ]; then
+            echo "allowed=true" >> $GITHUB_OUTPUT
+          else
+            echo "allowed=false" >> $GITHUB_OUTPUT
+            echo "Concurrency limit reached ($RUNNING/$MAX_PARALLEL). Issue will remain for scheduler to retry."
+          fi
+
+  run:
+    needs: check-concurrency
+    if: needs.check-concurrency.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      agent_failed: ${{ steps.run_agent.outcome == 'failure' }}
+      no_changes: ${{ steps.create_pr.outputs.changes_made != 'true' && steps.run_agent.outcome == 'success' }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -45,6 +75,111 @@ jobs:
           path: target-repo
           fetch-depth: 0
 
+      - name: Parse WORKFLOW.md config
+        id: workflow_config
+        run: |
+          # Defaults
+          AGENT_DEFAULT="opencode"
+          AGENT_MODELS_JSON='{}'
+          TIMEOUT_MINUTES=25
+          HOOKS_BEFORE_JSON='[]'
+          HOOKS_AFTER_JSON='[]'
+          RETRY_MAX_ATTEMPTS=3
+          BACKOFF_BASE=300
+          BACKOFF_MULTIPLIER=2
+          HAS_WORKFLOW_MD="false"
+          PROMPT_TEMPLATE=""
+
+          # Determine where to look for WORKFLOW.md
+          WORK_DIR="."
+          if [ -n "${{ github.event.inputs.target_repo }}" ] && [ -d "target-repo" ]; then
+            WORK_DIR="target-repo"
+          fi
+
+          if [ -f "$WORK_DIR/WORKFLOW.md" ]; then
+            HAS_WORKFLOW_MD="true"
+            echo "Found WORKFLOW.md, parsing config..."
+
+            # Extract YAML front matter (between first two --- markers)
+            FRONT_MATTER=$(sed -n '1 { /^---/ { :a; n; /^---/ q; p; ba } }' "$WORK_DIR/WORKFLOW.md")
+
+            # Extract prompt template (content after the second --- marker)
+            PROMPT_TEMPLATE=$(awk 'BEGIN{c=0} /^---/{c++; next} c>=2' "$WORK_DIR/WORKFLOW.md")
+
+            # Parse agent.default
+            AGENT_DEFAULT=$(echo "$FRONT_MATTER" | grep -oP '(?<=default:\s).+' | head -1)
+            [ -z "$AGENT_DEFAULT" ] && AGENT_DEFAULT="opencode"
+
+            # Parse agent.models into JSON
+            AGENT_MODELS_JSON=$(
+              echo "$FRONT_MATTER" | awk '/models:/, /^[a-z]/{if(/^[a-z]/ && !/^models/) exit; print}' |
+                grep -P '^\s+\S+:' |
+                sed 's/[[:space:]]*//g' |
+                awk -F: '{printf "\"%s\":\"%s\"", $1, $2}' |
+                sed 's/""/"/g; s/"/ "/g; s/^ /{/; s/$/}/'
+            )
+            [ -z "$AGENT_MODELS_JSON" ] || [ "$AGENT_MODELS_JSON" = "{}" ] && AGENT_MODELS_JSON='{}'
+
+            # Parse agent.timeout_minutes
+            TIMEOUT_MINUTES=$(echo "$FRONT_MATTER" | grep -oP '(?<=timeout_minutes:\s)\d+' | head -1)
+            [ -z "$TIMEOUT_MINUTES" ] && TIMEOUT_MINUTES=25
+
+            # Parse hooks.before_run into JSON array
+            BEFORE_RAW=$(
+              echo "$FRONT_MATTER" | awk '/before_run:/, /^[a-z]/{if(/^[a-z]/ && !/^before_run/) exit; print}' |
+                grep -P '^\s+-\s' |
+                sed 's/^\s*-\s*//'
+            )
+            if [ -n "$BEFORE_RAW" ]; then
+              HOOKS_BEFORE_JSON=$(echo "$BEFORE_RAW" | jq -R -s 'split("\n") | map(select(length > 0))')
+            fi
+
+            # Parse hooks.after_run into JSON array
+            AFTER_RAW=$(
+              echo "$FRONT_MATTER" | awk '/after_run:/, /^[a-z]/{if(/^[a-z]/ && !/^after_run/) exit; print}' |
+                grep -P '^\s+-\s' |
+                sed 's/^\s*-\s*//'
+            )
+            if [ -n "$AFTER_RAW" ]; then
+              HOOKS_AFTER_JSON=$(echo "$AFTER_RAW" | jq -R -s 'split("\n") | map(select(length > 0))')
+            fi
+
+            # Parse retry.max_attempts
+            RETRY_MAX_ATTEMPTS=$(echo "$FRONT_MATTER" | grep -oP '(?<=max_attempts:\s)\d+' | head -1)
+            [ -z "$RETRY_MAX_ATTEMPTS" ] && RETRY_MAX_ATTEMPTS=3
+
+            # Parse retry.backoff_base
+            BACKOFF_BASE=$(echo "$FRONT_MATTER" | grep -oP '(?<=backoff_base:\s)\d+' | head -1)
+            [ -z "$BACKOFF_BASE" ] && BACKOFF_BASE=300
+
+            # Parse retry.backoff_multiplier
+            BACKOFF_MULTIPLIER=$(echo "$FRONT_MATTER" | grep -oP '(?<=backoff_multiplier:\s)\d+' | head -1)
+            [ -z "$BACKOFF_MULTIPLIER" ] && BACKOFF_MULTIPLIER=2
+
+            echo "Parsed WORKFLOW.md config:"
+            echo "  agent.default: $AGENT_DEFAULT"
+            echo "  agent.timeout_minutes: $TIMEOUT_MINUTES"
+            echo "  retry.max_attempts: $RETRY_MAX_ATTEMPTS"
+            echo "  retry.backoff_base: $BACKOFF_BASE"
+            echo "  retry.backoff_multiplier: $BACKOFF_MULTIPLIER"
+          else
+            echo "No WORKFLOW.md found, using defaults"
+          fi
+
+          # Export as step outputs
+          echo "has_workflow_md=$HAS_WORKFLOW_MD" >> $GITHUB_OUTPUT
+          echo "agent_default=$AGENT_DEFAULT" >> $GITHUB_OUTPUT
+          echo "agent_models_json=$AGENT_MODELS_JSON" >> $GITHUB_OUTPUT
+          echo "timeout_minutes=$TIMEOUT_MINUTES" >> $GITHUB_OUTPUT
+          echo "hooks_before_json=$HOOKS_BEFORE_JSON" >> $GITHUB_OUTPUT
+          echo "hooks_after_json=$HOOKS_AFTER_JSON" >> $GITHUB_OUTPUT
+          echo "retry_max_attempts=$RETRY_MAX_ATTEMPTS" >> $GITHUB_OUTPUT
+          echo "backoff_base=$BACKOFF_BASE" >> $GITHUB_OUTPUT
+          echo "backoff_multiplier=$BACKOFF_MULTIPLIER" >> $GITHUB_OUTPUT
+
+          # Save prompt template to file for next step
+          echo "$PROMPT_TEMPLATE" > /tmp/prompt_template.txt
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -53,44 +188,130 @@ jobs:
       - name: Install opencode
         run: npm install -g opencode-ai
 
-      - name: Read issue and run agent
-        timeout-minutes: 25
+      - name: Build prompt and run agent
+        id: run_agent
+        timeout-minutes: ${{ steps.workflow_config.outputs.timeout_minutes }}
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
           OPENCODE_NO_AUTO_EXECUTE: '1'
-          OPENCODE_CONFIG_CONTENT: '{"model":"opencode/deepseek-v4-flash-free"}'
         run: |
           ISSUE_NUMBER="${{ github.event.inputs.issue_number }}"
           REPO="${{ github.repository }}"
+          AGENT="${{ github.event.inputs.agent }}"
 
-          # Fetch issue body
+          # --- Fetch issue data ---
           ISSUE_DATA=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json title,body,labels)
           TITLE=$(echo "$ISSUE_DATA" | jq -r '.title')
           BODY=$(echo "$ISSUE_DATA" | jq -r '.body')
 
-          # Extract prompt from issue body (content under "## 提示词")
-          PROMPT=$(echo "$BODY" | sed -n '/^## 提示词/,$ p' | tail -n +2 | sed '/^## /q' | head -n -1)
+          # Extract raw prompt from issue body (content under "## 提示词")
+          RAW_PROMPT=$(echo "$BODY" | sed -n '/^## 提示词/,$ p' | tail -n +2 | sed '/^## /q' | head -n -1)
+          if [ -z "$RAW_PROMPT" ]; then
+            RAW_PROMPT="$BODY"
+          fi
 
-          # If no explicit prompt section, use the full body
-          if [ -z "$PROMPT" ]; then
-            PROMPT="$BODY"
+          # --- Resolve model from config ---
+          AGENT_MODELS_JSON='${{ steps.workflow_config.outputs.agent_models_json }}'
+          DEFAULT_MODEL="opencode/deepseek-v4-flash-free"
+          MODEL="$DEFAULT_MODEL"
+          if [ "$AGENT_MODELS_JSON" != '{}' ]; then
+            CONFIGURED_MODEL=$(echo "$AGENT_MODELS_JSON" | jq -r --arg agent "$AGENT" '.[$agent] // empty')
+            if [ -n "$CONFIGURED_MODEL" ]; then
+              MODEL="$CONFIGURED_MODEL"
+            fi
+          fi
+          export OPENCODE_CONFIG_CONTENT="{\"model\":\"$MODEL\"}"
+          echo "Using model: $MODEL"
+
+          # --- Build final prompt ---
+          HAS_TEMPLATE="${{ steps.workflow_config.outputs.has_workflow_md }}"
+
+          if [ "$HAS_TEMPLATE" = "true" ] && [ -s /tmp/prompt_template.txt ]; then
+            echo "Using prompt template from WORKFLOW.md"
+
+            # Parse retry state from issue body
+            RETRY_COUNT=$(echo "$BODY" | grep -oP '(?<=retry_count:\s)\d+' | head -1)
+            [ -z "$RETRY_COUNT" ] && RETRY_COUNT=0
+            ATTEMPT=$((RETRY_COUNT + 1))
+            MAX_ATTEMPTS="${{ steps.workflow_config.outputs.retry_max_attempts }}"
+
+            # Get previous error from latest failure comment
+            PREVIOUS_ERROR=""
+            COMMENTS=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --comments --json comments -q '.comments[-1].body' 2>/dev/null || echo "")
+            if echo "$COMMENTS" | grep -q "failed\|Failed\|error\|Error"; then
+              PREVIOUS_ERROR=$(echo "$COMMENTS" | head -20)
+            fi
+
+            # Read template
+            PROMPT=$(cat /tmp/prompt_template.txt)
+
+            # Replace template variables
+            PROMPT=$(echo "$PROMPT" | sed "s|{{issue.number}}|$ISSUE_NUMBER|g")
+            PROMPT=$(echo "$PROMPT" | sed "s|{{issue.title}}|$TITLE|g")
+            PROMPT=$(echo "$PROMPT" | sed "s|{{issue.description}}|$RAW_PROMPT|g")
+            PROMPT=$(echo "$PROMPT" | sed "s|{{prompt}}|$RAW_PROMPT|g")
+            PROMPT=$(echo "$PROMPT" | sed "s|{{attempt}}|$ATTEMPT|g")
+            PROMPT=$(echo "$PROMPT" | sed "s|{{max_attempts}}|$MAX_ATTEMPTS|g")
+            PROMPT=$(echo "$PROMPT" | sed "s|{{previous_error}}|$PREVIOUS_ERROR|g")
+
+            # Handle conditional blocks: {{#if previous_error}}...{{/if}}
+            if [ -z "$PREVIOUS_ERROR" ]; then
+              # Remove entire conditional blocks when previous_error is empty
+              PROMPT=$(echo "$PROMPT" | perl -0777 -pe 's/\{\{#if previous_error\}\}.*?\{\{\/if\}\}//gs')
+            else
+              # Keep block content but strip if/endif markers
+              PROMPT=$(echo "$PROMPT" | sed 's/{{#if previous_error}}//g')
+              PROMPT=$(echo "$PROMPT" | sed 's/{{\/if}}//g')
+            fi
+          else
+            echo "No WORKFLOW.md template, using issue prompt directly"
+            PROMPT="$RAW_PROMPT"
           fi
 
           echo "=== Task: $TITLE ==="
           echo "=== Prompt ==="
           echo "$PROMPT"
 
-          # Update issue status to running
-          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label "status:pending" || true
+          # --- Update issue status to running ---
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label "status:pending" 2>/dev/null || true
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label "status:retrying" 2>/dev/null || true
           gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label "status:running"
 
-          # Run agent based on type
-          TARGET="${{ github.event.inputs.target_repo }}"
-          if [ -n "$TARGET" ]; then
-            cd target-repo
+          # --- Execute before_run hooks ---
+          HOOKS_BEFORE='${{ steps.workflow_config.outputs.hooks_before_json }}'
+          HOOK_COUNT=$(echo "$HOOKS_BEFORE" | jq 'length')
+
+          if [ "$HOOK_COUNT" -gt 0 ] && [ "$HOOKS_BEFORE" != '[]' ]; then
+            echo "=== Running before_run hooks ($HOOK_COUNT) ==="
+            WORK_DIR="${{ github.workspace }}"
+            if [ -n "${{ github.event.inputs.target_repo }}" ] && [ -d "target-repo" ]; then
+              WORK_DIR="${{ github.workspace }}/target-repo"
+            fi
+
+            for i in $(seq 0 $((HOOK_COUNT - 1))); do
+              HOOK_CMD=$(echo "$HOOKS_BEFORE" | jq -r ".[$i]")
+              # Replace template variables in hook command
+              HOOK_CMD=$(echo "$HOOK_CMD" | sed "s|{{issue.number}}|$ISSUE_NUMBER|g")
+              HOOK_CMD=$(echo "$HOOK_CMD" | sed "s|{{issue.title}}|$TITLE|g")
+              HOOK_CMD=$(echo "$HOOK_CMD" | sed "s|{{attempt}}|$ATTEMPT|g")
+              echo "Running before_run hook [$i]: $HOOK_CMD"
+              cd "$WORK_DIR"
+              eval "$HOOK_CMD"
+              if [ $? -ne 0 ]; then
+                echo "::error::before_run hook [$i] failed, aborting run"
+                exit 1
+              fi
+            done
           fi
 
-          case "${{ github.event.inputs.agent }}" in
+          # --- Run agent ---
+          WORK_DIR="${{ github.workspace }}"
+          if [ -n "${{ github.event.inputs.target_repo }}" ] && [ -d "target-repo" ]; then
+            WORK_DIR="${{ github.workspace }}/target-repo"
+          fi
+          cd "$WORK_DIR"
+
+          case "$AGENT" in
             opencode)
               opencode run "$PROMPT"
               ;;
@@ -98,10 +319,33 @@ jobs:
               claude "$PROMPT"
               ;;
             *)
-              echo "Unknown agent: ${{ github.event.inputs.agent }}"
+              echo "Unknown agent: $AGENT"
               exit 1
               ;;
           esac
+
+      - name: Execute after_run hooks
+        if: always()
+        continue-on-error: true
+        run: |
+          HOOKS_AFTER='${{ steps.workflow_config.outputs.hooks_after_json }}'
+          HOOK_COUNT=$(echo "$HOOKS_AFTER" | jq 'length')
+
+          if [ "$HOOK_COUNT" -gt 0 ] && [ "$HOOKS_AFTER" != '[]' ]; then
+            echo "=== Running after_run hooks ($HOOK_COUNT) ==="
+            ISSUE_NUMBER="${{ github.event.inputs.issue_number }}"
+            WORK_DIR="${{ github.workspace }}"
+            if [ -n "${{ github.event.inputs.target_repo }}" ] && [ -d "target-repo" ]; then
+              WORK_DIR="${{ github.workspace }}/target-repo"
+            fi
+
+            for i in $(seq 0 $((HOOK_COUNT - 1))); do
+              HOOK_CMD=$(echo "$HOOKS_AFTER" | jq -r ".[$i]")
+              echo "Running after_run hook [$i]: $HOOK_CMD"
+              cd "$WORK_DIR"
+              eval "$HOOK_CMD" || echo "::warning::after_run hook [$i] failed (non-blocking)"
+            done
+          fi
 
       - name: Create PR with changes
         id: create_pr
@@ -173,47 +417,87 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number,
-              body: `🔄 PR created at ${new Date().toISOString()}\n\nPlease review and merge. Issue will be auto-closed on merge.`
+              body: `:twisted_rightwards_arrows: PR created at ${new Date().toISOString()}\n\nPlease review and merge. Issue will be auto-closed on merge.`
             });
 
-      - name: Update issue status - no changes
-        if: success() && steps.create_pr.outputs.changes_made != 'true'
+      - name: Handle no changes or failure with retry logic
+        if: failure() || (success() && steps.create_pr.outputs.changes_made != 'true')
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
           script: |
             const issue_number = ${{ github.event.inputs.issue_number }};
-            await github.rest.issues.removeLabel({
-              owner: context.repo.owner, repo: context.repo.repo,
-              issue_number, name: 'status:running'
-            }).catch(() => {});
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner, repo: context.repo.repo,
-              issue_number, labels: ['status:failed']
-            });
-            await github.rest.issues.createComment({
-              owner: context.repo.owner, repo: context.repo.repo,
-              issue_number,
-              body: `⚠️ Agent completed but made no changes at ${new Date().toISOString()}`
-            });
+            const max_attempts = ${{ steps.workflow_config.outputs.retry_max_attempts }};
+            const backoff_base = ${{ steps.workflow_config.outputs.backoff_base }};
+            const backoff_multiplier = ${{ steps.workflow_config.outputs.backoff_multiplier }};
+            const agent_failed = '${{ steps.run_agent.outcome }}' === 'failure';
+            const no_changes = !agent_failed;
 
-      - name: Update issue status on failure
-        if: failure()
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.PAT_TOKEN }}
-          script: |
-            const issue_number = ${{ github.event.inputs.issue_number }};
+            // Fetch current issue body
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number
+            });
+            const body = issue.body || '';
+
+            // Parse current retry_count from body
+            const retryMatch = body.match(/retry_count:\s*(\d+)/);
+            let retry_count = retryMatch ? parseInt(retryMatch[1]) : 0;
+
+            const reason = agent_failed ? 'Agent execution failed' : 'Agent completed but made no changes';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // Remove status:running label
             await github.rest.issues.removeLabel({
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number, name: 'status:running'
             }).catch(() => {});
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner, repo: context.repo.repo,
-              issue_number, labels: ['status:failed']
-            });
-            await github.rest.issues.createComment({
-              owner: context.repo.owner, repo: context.repo.repo,
-              issue_number,
-              body: `❌ Agent execution **failed** at ${new Date().toISOString()}\n\nCheck [workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) for details.`
-            });
+
+            if (retry_count < max_attempts) {
+              // --- Retry ---
+              retry_count++;
+              const backoff_seconds = backoff_base * Math.pow(backoff_multiplier, retry_count - 1);
+              const next_retry = new Date(Date.now() + backoff_seconds * 1000);
+              const next_retry_str = next_retry.toISOString();
+
+              // Update issue body with retry metadata
+              let new_body = body;
+              // Remove existing retry metadata lines
+              new_body = new_body.replace(/retry_count:\s*\d+/g, '');
+              new_body = new_body.replace(/last_activity:\s*[^\n]*/g, '');
+              new_body = new_body.replace(/next_retry:\s*[^\n]*/g, '');
+
+              // Append updated metadata
+              new_body = new_body.trimEnd() + '\n' +
+                `retry_count: ${retry_count}\n` +
+                `last_activity: ${new Date().toISOString()}\n` +
+                `next_retry: ${next_retry_str}`;
+
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number, body: new_body
+              });
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number, labels: ['status:retrying']
+              });
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number,
+                body: `:repeat: Attempt ${retry_count}/${max_attempts} ${reason.toLowerCase()} at ${new Date().toISOString()}\n\nRetry scheduled for ${next_retry_str}\n\n[Workflow run](${runUrl})`
+              });
+            } else {
+              // --- Exhausted retries ---
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number, labels: ['status:failed']
+              });
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number,
+                body: `:x: **Failed after ${max_attempts} attempts** at ${new Date().toISOString()}\n\nLast reason: ${reason}\n\n[Workflow run](${runUrl})`
+              });
+            }

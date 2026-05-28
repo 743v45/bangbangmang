@@ -82,17 +82,27 @@
 
   // ─── Issue Body Parser ────────────────────────────────────
   function parseIssueBody(body) {
-    if (!body) return { targetRepo: '', execTime: '', agent: 'opencode', prompt: '' };
+    const defaults = { targetRepo: '', execTime: '', agent: 'opencode', prompt: '', retryCount: 0, maxRetries: 3, lastActivity: '', nextRetry: '' };
+    if (!body) return defaults;
     const repo = (body.match(/\*\*目标项目\*\*:\s*(\S+)/) || [])[1] || '';
     const time = (body.match(/\*\*执行时间\*\*:\s*(.+)/) || [])[1] || '';
     const agent = (body.match(/\*\*AI 客户端\*\*:\s*(\S+)/) || [])[1] || 'opencode';
     const promptMatch = body.match(/## 提示词\s*\n([\s\S]*)/);
     const prompt = promptMatch ? promptMatch[1].trim() : '';
-    return { targetRepo: repo, execTime: time.trim(), agent, prompt };
+    const retryMatch = body.match(/\*\*重试次数\*\*:\s*(\d+)\/(\d+)/);
+    const retryCount = retryMatch ? parseInt(retryMatch[1]) : 0;
+    const maxRetries = retryMatch ? parseInt(retryMatch[2]) : 3;
+    const lastActivity = (body.match(/\*\*上次活动\*\*:\s*(.+)/) || [])[1] || '';
+    const nextRetry = (body.match(/\*\*下次重试\*\*:\s*(.+)/) || [])[1] || '';
+    return { targetRepo: repo, execTime: time.trim(), agent, prompt, retryCount, maxRetries, lastActivity, nextRetry };
   }
 
-  function buildIssueBody({ targetRepo, execTime, agent, prompt }) {
-    return `## 任务配置\n\n- **目标项目**: ${targetRepo || getRepo()}\n- **执行时间**: ${execTime || '立即'}\n- **AI 客户端**: ${agent || 'opencode'}\n- **状态**: pending\n\n## 提示词\n\n${prompt || ''}`;
+  function buildIssueBody({ targetRepo, execTime, agent, prompt, retryCount, maxRetries, lastActivity, nextRetry }) {
+    const rc = retryCount !== undefined ? retryCount : 0;
+    const mr = maxRetries !== undefined ? maxRetries : 3;
+    const la = lastActivity || new Date().toISOString();
+    const nr = nextRetry || '-';
+    return `## 任务配置\n\n- **目标项目**: ${targetRepo || getRepo()}\n- **执行时间**: ${execTime || '立即'}\n- **AI 客户端**: ${agent || 'opencode'}\n- **状态**: pending\n- **重试次数**: ${rc}/${mr}\n- **上次活动**: ${la}\n- **下次重试**: ${nr}\n\n## 提示词\n\n${prompt || ''}`;
   }
 
   // ─── Status Helpers ───────────────────────────────────────
@@ -106,6 +116,7 @@
   function statusBadge(status) {
     const map = {
       pending:     { bg: 'bg-yellow-900/40 text-yellow-300 border-yellow-700', icon: '⏳' },
+      retrying:    { bg: 'bg-orange-900/40 text-orange-300 border-orange-700', icon: '🔁' },
       running:     { bg: 'bg-blue-900/40 text-blue-300 border-blue-700', icon: '🔄' },
       'pr-created':{ bg: 'bg-purple-900/40 text-purple-300 border-purple-700', icon: '🔀' },
       done:        { bg: 'bg-green-900/40 text-green-300 border-green-700', icon: '✅' },
@@ -228,6 +239,11 @@
             class="w-full py-2 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors">
             保存
           </button>
+          <div class="mt-6 pt-6 border-t border-gray-700">
+            <h3 class="text-white font-medium mb-2">Workflow 配置</h3>
+            <p class="text-gray-500 text-sm">Agent 和重试策略通过 <code class="text-gray-400">WORKFLOW.md</code> 配置</p>
+            <a href="https://github.com/${getRepo()}/blob/master/WORKFLOW.md" target="_blank" class="text-blue-400 text-sm hover:underline mt-1 inline-block">查看/编辑 WORKFLOW.md →</a>
+          </div>
         </div>
       </div>
     `;
@@ -258,6 +274,7 @@
             class="px-2 py-1 bg-dark-400 border border-gray-600 rounded text-sm text-white focus:outline-none">
             <option value="">全部状态</option>
             <option value="status:pending">⏳ 等待中</option>
+            <option value="status:retrying">🔁 重试中</option>
             <option value="status:running">🔄 执行中</option>
             <option value="status:pr-created">🔀 PR 已创建</option>
             <option value="status:done">✅ 已完成</option>
@@ -302,17 +319,19 @@
               <div class="flex items-center gap-2 mb-1">
                 ${statusBadge(status)}
                 <span class="text-gray-500 text-xs">#${issue.number}</span>
+                ${p.retryCount > 0 ? `<span class="text-orange-400 text-xs">🔁 ${p.retryCount}/${p.maxRetries}</span>` : ''}
               </div>
               <h3 class="text-white font-medium truncate cursor-pointer hover:text-blue-400"
                 onclick="navigate('edit-${issue.number}')">${issue.title}</h3>
               <div class="flex items-center gap-3 mt-2 text-xs text-gray-500">
                 ${p.targetRepo ? `<span>📁 ${p.targetRepo}</span>` : ''}
                 ${p.execTime ? `<span>🕐 ${p.execTime}</span>` : ''}
+                ${status === 'retrying' && p.nextRetry && p.nextRetry !== '-' ? `<span class="text-orange-400">⏱ ${timeAgo(p.nextRetry)}重试</span>` : ''}
                 <span>🕐 ${timeAgo(issue.updated_at)}</span>
               </div>
             </div>
             <div class="flex items-center gap-1 shrink-0">
-              ${(status === 'pending' || status === 'failed') ? `
+              ${(status === 'pending' || status === 'failed' || status === 'retrying') ? `
                 <button onclick="triggerTask(${issue.number})"
                   class="p-2 rounded-lg bg-green-600/20 text-green-400 hover:bg-green-600/40 transition-colors" title="立即执行">
                   ${icons.play}
@@ -483,7 +502,7 @@
               class="flex-1 py-2 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors">
               保存修改
             </button>
-            ${(status === 'pending' || status === 'failed') ? `
+            ${(status === 'pending' || status === 'failed' || status === 'retrying') ? `
               <button onclick="triggerAndGo(${num})"
                 class="flex-1 py-2 px-4 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium transition-colors">
                 立即执行
