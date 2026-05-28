@@ -110,14 +110,19 @@ jobs:
             AGENT_DEFAULT=$(echo "$FRONT_MATTER" | grep -oP '(?<=default:\s).+' | head -1)
             [ -z "$AGENT_DEFAULT" ] && AGENT_DEFAULT="opencode"
 
-            # Parse agent.models into JSON
-            AGENT_MODELS_JSON=$(
-              echo "$FRONT_MATTER" | awk '/models:/, /^[a-z]/{if(/^[a-z]/ && !/^models/) exit; print}' |
-                grep -P '^\s+\S+:' |
-                sed 's/[[:space:]]*//g' |
-                awk -F: '{printf "\"%s\":\"%s\"", $1, $2}' |
-                sed 's/""/"/g; s/"/ "/g; s/^ /{/; s/$/}/'
-            )
+            # Parse agent.models into JSON (simplified approach)
+            AGENT_MODELS_JSON=$(echo "$FRONT_MATTER" | awk '
+              BEGIN { found=0; print "{" }
+              /models:/ { found=1; next }
+              found && /^[a-z]/ { exit }
+              found && /^\s+[a-z]+:/ {
+                gsub(/^[[:space:]]+/, ""); gsub(/:[[:space:]]*/, ":");
+                gsub(/"/, "\\\"");
+                if (NR > 1) printf ","
+                printf "\"%s\"", $0
+              }
+              END { print "}" }
+            ')
             [ -z "$AGENT_MODELS_JSON" ] || [ "$AGENT_MODELS_JSON" = "{}" ] && AGENT_MODELS_JSON='{}'
 
             # Parse agent.timeout_minutes
