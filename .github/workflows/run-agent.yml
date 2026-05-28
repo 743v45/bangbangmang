@@ -249,19 +249,37 @@ jobs:
             # Read template
             PROMPT=$(cat /tmp/prompt_template.txt)
 
-            # Use perl for all replacements - handles multiline variables safely
-            PROMPT=$(perl -e '
-              undef $/;
-              $_ = <STDIN>;
-              s/{{issue\.number}}/$ENV{"ISSUE_NUMBER"}/g;
-              s/{{issue\.title}}/$ENV{"TITLE"}/g;
-              s/{{issue\.description}}/$ENV{"RAW_PROMPT"}/g;
-              s/{{prompt}}/$ENV{"RAW_PROMPT"}/g;
-              s/{{attempt}}/$ENV{"ATTEMPT"}/g;
-              s/{{max_attempts}}/$ENV{"MAX_ATTEMPTS"}/g;
-              s/{{previous_error}}/$ENV{"PREVIOUS_ERROR"}/g;
-              print;
-            ' <<< "$PROMPT")
+            # Write variables to files for reliable multiline handling
+            printf '%s' "$ISSUE_NUMBER" > /tmp/var_num.txt
+            printf '%s' "$TITLE" > /tmp/var_title.txt
+            printf '%s' "$RAW_PROMPT" > /tmp/var_desc.txt
+            printf '%s' "$ATTEMPT" > /tmp/var_attempt.txt
+            printf '%s' "$MAX_ATTEMPTS" > /tmp/var_max.txt
+            printf '%s' "$PREVIOUS_ERROR" > /tmp/var_err.txt
+
+            # Write template to file
+            printf '%s' "$PROMPT" > /tmp/prompt_input.txt
+
+            # Use perl for replacements - read variables from files
+            perl -e '
+              open(my $num_fh, "<", "/tmp/var_num.txt"); my $num = do { local $/; <$num_fh> }; close($num_fh);
+              open(my $title_fh, "<", "/tmp/var_title.txt"); my $title = do { local $/; <$title_fh> }; close($title_fh);
+              open(my $desc_fh, "<", "/tmp/var_desc.txt"); my $desc = do { local $/; <$desc_fh> }; close($desc_fh);
+              open(my $attempt_fh, "<", "/tmp/var_attempt.txt"); my $attempt = do { local $/; <$attempt_fh> }; close($attempt_fh);
+              open(my $max_fh, "<", "/tmp/var_max.txt"); my $max = do { local $/; <$max_fh> }; close($max_fh);
+              open(my $err_fh, "<", "/tmp/var_err.txt"); my $err = do { local $/; <$err_fh> }; close($err_fh);
+              open(my $in_fh, "<", "/tmp/prompt_input.txt"); my $content = do { local $/; <$in_fh> }; close($in_fh);
+              $content =~ s/{{issue\.number}}/$num/g;
+              $content =~ s/{{issue\.title}}/$title/g;
+              $content =~ s/{{issue\.description}}/$desc/g;
+              $content =~ s/{{prompt}}/$desc/g;
+              $content =~ s/{{attempt}}/$attempt/g;
+              $content =~ s/{{max_attempts}}/$max/g;
+              $content =~ s/{{previous_error}}/$err/g;
+              print $content;
+            ' > /tmp/prompt_output.txt
+
+            PROMPT=$(cat /tmp/prompt_output.txt)
 
             # Handle conditional blocks: {{#if previous_error}}...{{/if}}
             if [ -z "$PREVIOUS_ERROR" ]; then
